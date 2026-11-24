@@ -99,18 +99,26 @@ def finde_profil(text):
 
 
 def kommission_key(text):
+    text = (text or "").strip()
     # 5-stellige Nummer am Anfang; sonst die erste alleinstehende 5-stellige Nummer im Text
-    m = re.match(r"\s*(\d{5})(?!\d)", text or "") or re.search(r"(?<!\d)(\d{5})(?!\d)", text or "")
-    return m.group(1) if m else OHNE
+    m = re.match(r"(\d{5})(?!\d)", text) or re.search(r"(?<!\d)(\d{5})(?!\d)", text)
+    if m:
+        return m.group(1)
+    # keine Kommissionsnummer, aber ein Text (z. B. heroal-Bestellnummer "122257 ART BTV"):
+    # als eigene Zeile führen - Schlüssel ist die führende Nummer, sonst der ganze Text
+    m = re.match(r"(\d+)\b", text)
+    return m.group(1) if m else (text or OHNE)
 
 
 def beschreibung(text):
     # "26010_RK SCHAFFERER WA LANS" / "26010/MKO X" -> "SCHAFFERER WA LANS" / "X"
-    if kommission_key(text) == OHNE:
-        return (text or "").strip()
-    if not re.match(r"\s*\d{5}(?!\d)", text):
-        return text.strip()
-    return re.sub(r"^\s*\d{5}(?:[_/]?[A-Za-z]{2,4}(?=\s|$))?\s*[-–]?\s*", "", text).strip()
+    text = (text or "").strip()
+    if re.match(r"\d{5}(?!\d)", text):
+        return re.sub(r"^\d{5}(?:[_/]?[A-Za-z]{2,4}(?=\s|$))?\s*[-–]?\s*", "", text).strip()
+    if re.search(r"(?<!\d)\d{5}(?!\d)", text):
+        return text
+    m = re.match(r"\d+\b\s*(.*)", text)
+    return m.group(1) if m else ""
 
 
 def auswerten(text, p):
