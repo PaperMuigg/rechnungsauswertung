@@ -5,12 +5,15 @@ Lieferanten: siehe PROFILE weiter unten.
 Bedienung:
   - PDF(s) auf die .exe ziehen, oder
   - .exe doppelklicken und PDF(s) auswählen.
-Für jede Rechnung wird neben dem PDF eine Excel-Datei "<PDF-Name>_Kommissionen.xlsx" erzeugt.
+Es öffnet sich eine temporäre Excel-Datei (wird nirgends neben den PDFs gespeichert):
+ein Blatt pro Rechnung, bei mehreren Rechnungen zusätzlich das Blatt "Baustellen".
 """
 import os
 import re
 import sys
+import tempfile
 from collections import OrderedDict
+from datetime import datetime
 from decimal import Decimal, ROUND_DOWN
 
 import pdfplumber
@@ -187,33 +190,32 @@ def anteilig(kommissionen, zuschlag_gesamt):
     return {key: Decimal(c) / 100 for key, c in ganz.items()}
 
 
-def schreibe_excel(ziel, info, kommissionen, zuschlaege, summe_pos, netto):
+FETT = Font(bold=True)
+KOPF_FILL = PatternFill("solid", fgColor="D9E1F2")
+LINIE = Border(top=Side(style="thin"))
+EUR = '#,##0.00 "€"'
+
+
+def sortkey(k):
+    return (k == OHNE, k)
+
+
+def fuelle_blatt(ws, info, kommissionen, zuschlaege, summe_pos, netto):
+    """Schreibt die Auswertung einer Rechnung in ein Blatt. Rückgabe: (ok, {Kommission: Netto gesamt})."""
     zuschlag_gesamt = sum((b for _, b in zuschlaege), Decimal("0"))
     anteile = anteilig(kommissionen, zuschlag_gesamt)
     summe_zw = sum((k["summe"] for k in kommissionen.values()), Decimal("0"))
     summe_neu = summe_zw + sum(anteile.values(), Decimal("0"))
-
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Kommissionen"
-    fett = Font(bold=True)
-    kopf_fill = PatternFill("solid", fgColor="D9E1F2")
-    linie = Border(top=Side(style="thin"))
-    eur = '#,##0.00 "€"'
 
     ws["A1"] = f"{info['lieferant']} – Rechnung {info['nummer']} vom {info['datum']}"
     ws["A1"].font = Font(bold=True, size=13)
     zuschlag_text = ", ".join(f"{n} {str(b).replace('.', ',')} €" for n, b in zuschlaege) or "keine"
     ws["A2"] = f"Zuschläge (anteilig verteilt): {zuschlag_text}"
 
-    kopf = ["Kommission", "Baustelle", "Zwischensummen", "Anteil Zuschläge", "Netto gesamt"]
     ws.append([])
-    ws.append(kopf)
+    ws.append(["Kommission", "Baustelle", "Zwischensummen", "Anteil Zuschläge", "Netto gesamt"])
     for c in ws[4]:
-        c.font, c.fill = fett, kopf_fill
-
-    def sortkey(k):
-        return (k == OHNE, k)
+        c.font, c.fill = FETT, KOPF_FILL
 
     for key in sorted(kommissionen, key=sortkey):
         k = kommissionen[key]
@@ -222,14 +224,14 @@ def schreibe_excel(ziel, info, kommissionen, zuschlaege, summe_pos, netto):
 
     ws.append(["Summe", "", float(summe_zw), float(zuschlag_gesamt), float(summe_neu)])
     for c in ws[ws.max_row]:
-        c.font, c.border = fett, linie
+        c.font, c.border = FETT, LINIE
 
     # Kontrolle
     ok_pos = summe_pos is None or summe_zw == summe_pos
     ok_netto = netto is not None and summe_neu == netto
     ws.append([])
     ws.append(["Kontrolle"])
-    ws[ws.max_row][0].font = fett
+    ws[ws.max_row][0].font = FETT
     if summe_pos is not None:
         ws.append(["Summe Positionen laut PDF", "", float(summe_pos), "", "OK" if ok_pos else "FEHLER"])
     ws.append(["Nettosumme laut PDF", "", "", "", float(netto) if netto is not None else "nicht gefunden"])
@@ -238,28 +240,113 @@ def schreibe_excel(ziel, info, kommissionen, zuschlaege, summe_pos, netto):
     for zeile in ws.iter_rows(min_row=5):
         for c in zeile[2:5]:
             if isinstance(c.value, float):
-                c.number_format = eur
+                c.number_format = EUR
     for spalte, breite in zip("ABCDE", (16, 45, 17, 17, 17)):
         ws.column_dimensions[spalte].width = breite
     ws.freeze_panes = "A5"
 
-    wb.save(ziel)
-    return ok_pos and ok_netto, summe_zw, summe_neu, summe_pos, netto
+    return ok_pos and ok_netto, {key: (kommissionen[key]["namen"], kommissionen[key]["summe"] + anteile[key])
+                                 for key in kommissionen}
 
 
-def verarbeite(pfad):
+def fuelle_baustellen(ws, rechnungen, ausgelassen):
+    """Sammelblatt: pro Kommission jede Rechnung mit Betrag, darunter die Summe der Kommission."""
+    ws["A1"] = "Baustellen – alle Rechnungen zusammen"
+    ws["A1"].font = Font(bold=True, size=13)
+    ws["A2"] = ("Nicht enthalten (Summen stimmen nicht): " + ", ".join(ausgelassen)) if ausgelassen \
+        else "Alle gelesenen Rechnungen enthalten."
+    if ausgelassen:
+        ws["A2"].font = Font(bold=True, color="C00000")
+    ws.append([])
+    ws.append(["Kommission", "Baustelle", "Lieferant", "Rechnung", "Datum", "Netto"])
+    for c in ws[4]:
+        c.font, c.fill = FETT, KOPF_FILL
+
+    je_kom = {}
+    for info, betraege in rechnungen:
+        for key, (namen, betrag) in betraege.items():
+            je_kom.setdefault(key, []).append((info, namen, betrag))
+
+    gesamt = Decimal("0")
+    for key in sorted(je_kom, key=sortkey):
+        summe = Decimal("0")
+        for info, namen, betrag in je_kom[key]:
+            ws.append([key, " / ".join(namen), info["lieferant"], info["nummer"], info["datum"], float(betrag)])
+            summe += betrag
+        ws.append([f"Summe {key}", "", "", "", "", float(summe)])
+        for c in ws[ws.max_row]:
+            c.font, c.border = FETT, LINIE
+        ws.append([])
+        gesamt += summe
+    ws.append(["Gesamt", "", "", "", "", float(gesamt)])
+    for c in ws[ws.max_row]:
+        c.font, c.border = FETT, LINIE
+    ws.append(["Summe der Rechnungen (Kontrolle)", "", "", "", "",
+               float(sum((sum((b for _, b in bt.values()), Decimal("0")) for _, bt in rechnungen), Decimal("0")))])
+
+    for zeile in ws.iter_rows(min_row=5):
+        if isinstance(zeile[5].value, float):
+            zeile[5].number_format = EUR
+    for spalte, breite in zip("ABCDEF", (30, 45, 16, 16, 12, 17)):
+        ws.column_dimensions[spalte].width = breite
+    ws.freeze_panes = "A5"
+
+
+def lies_rechnung(pfad):
     text = lies_text(pfad)
     if not text.strip():
         raise ValueError("Kein Text im PDF (gescannt?) - Texterkennung ist noch nicht eingebaut.")
     profil = finde_profil(text)
     if profil is None:
         raise ValueError("Unbekannter Lieferant - dafür gibt es noch kein Profil.")
-    info, kommissionen, zuschlaege, summe_pos, netto = auswerten(text, profil)
-    if not kommissionen:
+    daten = auswerten(text, profil)
+    if not daten[1]:
         raise ValueError(f"Keine Beträge gefunden (Profil {profil['name']}).")
-    ziel = os.path.splitext(pfad)[0] + "_Kommissionen.xlsx"
-    ok, *_ = schreibe_excel(ziel, info, kommissionen, zuschlaege, summe_pos, netto)
-    return ziel, ok
+    return daten
+
+
+def blattname(wb, info):
+    name = re.sub(r"[\[\]:*?/\\]", "-", f"{info['lieferant'][:12]} {info['nummer']}".strip())[:31] or "Rechnung"
+    basis, n = name, 2
+    while name in wb.sheetnames:
+        name = f"{basis[:28]}_{n}"
+        n += 1
+    return name
+
+
+def erstelle_mappe(dateien):
+    """Liest alle PDFs. Rückgabe: (Workbook oder None, Meldungen, Fehler ja/nein)."""
+    wb = Workbook()
+    wb.remove(wb.active)
+    meldungen, fehler = [], False
+    rechnungen, ausgelassen, gesehen = [], [], set()
+    for pfad in dateien:
+        name = os.path.basename(pfad)
+        try:
+            info, kommissionen, zuschlaege, summe_pos, netto = lies_rechnung(pfad)
+            kennung = (info["lieferant"], info["nummer"])
+            if info["nummer"] and kennung in gesehen:
+                meldungen.append(f"⚠ {name}: Rechnung {info['nummer']} ist doppelt - nur einmal gezählt.")
+                fehler = True
+                continue
+            gesehen.add(kennung)
+            ws = wb.create_sheet(blattname(wb, info))
+            ok, betraege = fuelle_blatt(ws, info, kommissionen, zuschlaege, summe_pos, netto)
+            if ok:
+                rechnungen.append((info, betraege))
+                meldungen.append(f"✔ {name}: OK, Summen stimmen.")
+            else:
+                fehler = True
+                ausgelassen.append(f"{info['lieferant']} {info['nummer']}")
+                meldungen.append(f"⚠ {name}: Summen stimmen NICHT mit dem PDF überein - bitte prüfen!")
+        except Exception as e:  # noqa: BLE001
+            fehler = True
+            meldungen.append(f"✖ {name}: {e}")
+    if not wb.sheetnames:
+        return None, meldungen, fehler
+    if len(wb.sheetnames) > 1:
+        fuelle_baustellen(wb.create_sheet("Baustellen"), rechnungen, ausgelassen)
+    return wb, meldungen, fehler
 
 
 def main():
@@ -276,27 +363,22 @@ def main():
         if not dateien:
             return
 
-    meldungen, fehler = [], False
-    for pfad in dateien:
-        name = os.path.basename(pfad)
-        try:
-            ziel, ok = verarbeite(pfad)
-            if ok:
-                meldungen.append(f"✔ {name}: OK, Summen stimmen.")
-            else:
-                fehler = True
-                meldungen.append(f"⚠ {name}: Summen stimmen NICHT mit dem PDF überein - bitte prüfen!")
-            if gui and len(dateien) == 1:
-                os.startfile(ziel)
-        except Exception as e:  # noqa: BLE001
-            fehler = True
-            meldungen.append(f"✖ {name}: {e}")
-
+    wb, meldungen, fehler = erstelle_mappe(dateien)
     text = "\n".join(meldungen)
+    ziel = None
+    if wb is not None:
+        # nur temporär: Excel öffnet die Datei, gespeichert wird nur, wenn man es in Excel selbst tut
+        ziel = os.path.join(tempfile.mkdtemp(prefix="Rechnungsauswertung_"),
+                            f"Rechnungsauswertung_{datetime.now():%Y-%m-%d_%H%M%S}.xlsx")
+        wb.save(ziel)
     if gui:
-        (messagebox.showwarning if fehler else messagebox.showinfo)("Rechnungsauswertung", text)
+        if fehler or ziel is None:
+            messagebox.showwarning("Rechnungsauswertung", text)
+        if ziel:
+            os.startfile(ziel)
     else:
         print(text)
+        print(ziel)
 
 
 if __name__ == "__main__":
