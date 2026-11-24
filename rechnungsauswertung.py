@@ -78,6 +78,16 @@ PROFILE = [
         "netto": r"\bNetto\s+" + BETRAG + r"$",
         "ende": r"Gesamtsumme EUR",
     },
+    {
+        "name": "Süd-Metall",
+        "erkennung": r"Süd-Metall Beschläge GmbH",
+        "nummer": r"Rechnungsnr\.\s+(\S+)",
+        "datum": r"Datum:\s+([\d.]+)",
+        "kommission": r"^(?i:kom)\.?:?\s+(\S.*)",
+        "betrag": r"^\d\d\.\d\d\.\d{4} .*\s" + BETRAG + r"$",
+        "netto": r"^Total EUR\s+" + BETRAG + r"$",
+        "ende": r"^Total EUR",
+    },
 ]
 
 
@@ -89,7 +99,8 @@ def finde_profil(text):
 
 
 def kommission_key(text):
-    m = re.match(r"\s*(\d{5})(?!\d)", text or "")
+    # 5-stellige Nummer am Anfang; sonst die erste alleinstehende 5-stellige Nummer im Text
+    m = re.match(r"\s*(\d{5})(?!\d)", text or "") or re.search(r"(?<!\d)(\d{5})(?!\d)", text or "")
     return m.group(1) if m else OHNE
 
 
@@ -97,6 +108,8 @@ def beschreibung(text):
     # "26010_RK SCHAFFERER WA LANS" / "26010/MKO X" -> "SCHAFFERER WA LANS" / "X"
     if kommission_key(text) == OHNE:
         return (text or "").strip()
+    if not re.match(r"\s*\d{5}(?!\d)", text):
+        return text.strip()
     return re.sub(r"^\s*\d{5}(?:[_/]?[A-Za-z]{2,4}(?=\s|$))?\s*[-–]?\s*", "", text).strip()
 
 
