@@ -1,4 +1,6 @@
-"""Rechnungsauswertung - fasst Zwischensummen einer Schachermayer-Rechnung pro Kommission zusammen.
+"""Rechnungsauswertung - fasst die Beträge von Lieferantenrechnungen pro Kommission zusammen.
+
+Lieferanten: siehe PROFILE weiter unten.
 
 Bedienung:
   - PDF(s) auf die .exe ziehen, oder
@@ -28,22 +30,85 @@ def lies_text(pfad):
         return "\n".join(seite.extract_text() or "" for seite in pdf.pages)
 
 
+# ---------------------------------------------------------------------------
+# Lieferanten-Profile: pro Lieferant die Leseregeln (reguläre Ausdrücke).
+#   erkennung  Text, der nur auf Rechnungen dieses Lieferanten vorkommt
+#   rechnung   Rechnungsnummer (Gruppe 1) und Datum (Gruppe 2); oder nummer/datum einzeln
+#   reset      Zeile, ab der eine neue Lieferung beginnt (Kommission wird vergessen)
+#   kommission Zeile mit der Kommission (Gruppe 1 = Text nach der Markierung)
+#   betrag     Zeile, deren Betrag (Gruppe 1) zur aktuellen Kommission zählt
+#   summe_pos  Summe aller Positionen laut PDF (Kontrolle, optional)
+#   zuschlag   Zuschlagszeile im Rechnungsfuß (Gruppe 1 = Name, Gruppe 2 = Betrag)
+#   netto      Nettosumme laut PDF (Gruppe 1; mehrere Treffer werden addiert)
+#   ende       ab dieser Zeile wird nichts mehr gelesen
+# Neuer Lieferant = neuer Eintrag hier.
+# ---------------------------------------------------------------------------
+PROFILE = [
+    {
+        "name": "Schachermayer",
+        "erkennung": r"Schachermayer GmbH",
+        "rechnung": r"Rechnungsnummer:\s*(\d+)\s+Datum:\s*([\d.]+)",
+        "reset": r"^Auftrag:\s*\d+",
+        "kommission": r"^(?:Best\.Nr\.|Kommission):\s*(.*)",
+        "betrag": r"^Zwischensumme Auftrag:.*?" + BETRAG + r"$",
+        "summe_pos": r"^Summe Positionen\s+" + BETRAG,
+        "zuschlag": r"^(.+?)\s+" + BETRAG + r"$",
+        "netto": r"^Mehrwertsteuer.*?aus\s+" + BETRAG,
+        "ende": r"^Endbetrag",
+    },
+    {
+        "name": "heroal",
+        "erkennung": r"heroal – Johann Henkenjohann",
+        "rechnung": r"(?m)^\d\d\.\d{3} (\d{3}\.\d{3}) (\d\d?\.\d\d\.\d\d)$",
+        "reset": r"^\$ Auftrag:",
+        "kommission": r"^Kom\.:\s*(.*)",
+        "betrag": r"^Zwischen-Summe\s+" + BETRAG + r"$",
+        "netto": r"^Rechnungsbetrag\s*:\s*EUR\s+" + BETRAG,
+        "ende": r"^Rechnungsbetrag",
+    },
+    {
+        "name": "Vetrotech",
+        "erkennung": r"VETROTECH SAINT-GOBAIN",
+        "nummer": r"(?m)^Nummer\s+(\d+)",
+        "datum": r"(?m)^Datum\s+([\d.]+)",
+        "kommission": r"^Kommission:\s*(.*)",
+        "betrag": r"^\d+ \S+ \d+ \d+ x \d+ .*?\s" + BETRAG + r"$",
+        "summe_pos": r"Zwischensumme EUR\s+" + BETRAG,
+        "zuschlag": r"(\w*(?:zuschlag|pauschale|zustellung|entladung)\w*)\b.*?\s" + BETRAG + r"$",
+        "netto": r"\bNetto\s+" + BETRAG + r"$",
+        "ende": r"Gesamtsumme EUR",
+    },
+]
+
+
+def finde_profil(text):
+    for p in PROFILE:
+        if re.search(p["erkennung"], text):
+            return p
+    return None
+
+
 def kommission_key(text):
-    m = re.match(r"\s*(\d{5})", text or "")
+    m = re.match(r"\s*(\d{5})(?!\d)", text or "")
     return m.group(1) if m else OHNE
 
 
 def beschreibung(text):
-    # "26010_RK SCHAFFERER WA LANS" -> "SCHAFFERER WA LANS"
-    t = re.sub(r"^\s*\d{5}(?:_?[A-Za-z]{2,4}(?=\s|$))?\s*[-–]?\s*", "", text or "").strip()
-    return t
+    # "26010_RK SCHAFFERER WA LANS" / "26010/MKO X" -> "SCHAFFERER WA LANS" / "X"
+    if kommission_key(text) == OHNE:
+        return (text or "").strip()
+    return re.sub(r"^\s*\d{5}(?:[_/]?[A-Za-z]{2,4}(?=\s|$))?\s*[-–]?\s*", "", text).strip()
 
 
-def auswerten(text):
-    info = {"nummer": "", "datum": ""}
-    m = re.search(r"Rechnungsnummer:\s*(\d+)\s+Datum:\s*([\d.]+)", text)
-    if m:
-        info["nummer"], info["datum"] = m.group(1), m.group(2)
+def auswerten(text, p):
+    info = {"nummer": "", "datum": "", "lieferant": p["name"]}
+    if "rechnung" in p:
+        if m := re.search(p["rechnung"], text):
+            info["nummer"], info["datum"] = m.group(1), m.group(2)
+    else:
+        for feld in ("nummer", "datum"):
+            if m := re.search(p[feld], text):
+                info[feld] = m.group(1)
 
     kommissionen = OrderedDict()  # key -> {"namen": [], "summe": Decimal}
     zuschlaege = []               # (Bezeichnung, Betrag)
@@ -51,34 +116,37 @@ def auswerten(text):
     netto = Decimal("0")
     netto_gefunden = False
     aktuell = ""
-    im_fuss = False
+    im_fuss = "summe_pos" not in p
+
+    def passt(feld, zeile):
+        return re.search(p[feld], zeile) if feld in p else None
 
     for zeile in text.splitlines():
         s = zeile.strip()
         # Unterstreichungslinien überlagern im PDF manchmal den Text -> für Summenzeilen entfernen
         u = re.sub(r"\s+", " ", s.replace("_", "")).strip()
-        if m := re.match(r"Auftrag:\s*\d+", s):
+        if passt("reset", s):
             aktuell = ""
-        elif m := re.match(r"Best\.Nr\.:\s*(.*)", s):
+        elif m := passt("kommission", s):
             aktuell = m.group(1).strip()
-        elif m := re.match(r"Kommission:\s*(.*)", s):
-            aktuell = m.group(1).strip()
-        elif m := re.match(r"Zwischensumme Auftrag:.*?" + BETRAG + r"$", u):
+        elif m := passt("betrag", u):
             key = kommission_key(aktuell)
             k = kommissionen.setdefault(key, {"namen": [], "summe": Decimal("0")})
             k["summe"] += zahl(m.group(1))
             name = beschreibung(aktuell)
             if name and name.upper() not in [n.upper() for n in k["namen"]]:
                 k["namen"].append(name)
-        elif m := re.match(r"Summe Positionen\s+" + BETRAG, u):
+        elif m := passt("summe_pos", u):
             summe_pos = zahl(m.group(1))
             im_fuss = True
-        elif im_fuss and (m := re.match(r"Mehrwertsteuer.*?aus\s+" + BETRAG, u)):
+        elif m := passt("netto", u):
             netto += zahl(m.group(1))
             netto_gefunden = True
-        elif im_fuss and u.startswith("Endbetrag"):
-            im_fuss = False
-        elif im_fuss and not netto_gefunden and (m := re.match(r"(.+?)\s+" + BETRAG + r"$", u)):
+            if passt("ende", u):
+                break
+        elif passt("ende", u):
+            break
+        elif im_fuss and not netto_gefunden and (m := passt("zuschlag", u)):
             zuschlaege.append((m.group(1).strip(), zahl(m.group(2))))
 
     return info, kommissionen, zuschlaege, summe_pos, (netto if netto_gefunden else None)
@@ -112,7 +180,7 @@ def schreibe_excel(ziel, info, kommissionen, zuschlaege, summe_pos, netto):
     linie = Border(top=Side(style="thin"))
     eur = '#,##0.00 "€"'
 
-    ws["A1"] = f"Rechnung {info['nummer']} vom {info['datum']}"
+    ws["A1"] = f"{info['lieferant']} – Rechnung {info['nummer']} vom {info['datum']}"
     ws["A1"].font = Font(bold=True, size=13)
     zuschlag_text = ", ".join(f"{n} {str(b).replace('.', ',')} €" for n, b in zuschlaege) or "keine"
     ws["A2"] = f"Zuschläge (anteilig verteilt): {zuschlag_text}"
@@ -136,13 +204,13 @@ def schreibe_excel(ziel, info, kommissionen, zuschlaege, summe_pos, netto):
         c.font, c.border = fett, linie
 
     # Kontrolle
-    ok_pos = summe_pos is not None and summe_zw == summe_pos
+    ok_pos = summe_pos is None or summe_zw == summe_pos
     ok_netto = netto is not None and summe_neu == netto
     ws.append([])
     ws.append(["Kontrolle"])
     ws[ws.max_row][0].font = fett
-    ws.append(["Summe Positionen laut PDF", "", float(summe_pos) if summe_pos is not None else "nicht gefunden",
-               "", "OK" if ok_pos else "FEHLER"])
+    if summe_pos is not None:
+        ws.append(["Summe Positionen laut PDF", "", float(summe_pos), "", "OK" if ok_pos else "FEHLER"])
     ws.append(["Nettosumme laut PDF", "", "", "", float(netto) if netto is not None else "nicht gefunden"])
     ws.append(["Abgleich Netto gesamt", "", "", "", "OK" if ok_netto else "FEHLER"])
 
@@ -160,9 +228,14 @@ def schreibe_excel(ziel, info, kommissionen, zuschlaege, summe_pos, netto):
 
 def verarbeite(pfad):
     text = lies_text(pfad)
-    info, kommissionen, zuschlaege, summe_pos, netto = auswerten(text)
+    if not text.strip():
+        raise ValueError("Kein Text im PDF (gescannt?) - Texterkennung ist noch nicht eingebaut.")
+    profil = finde_profil(text)
+    if profil is None:
+        raise ValueError("Unbekannter Lieferant - dafür gibt es noch kein Profil.")
+    info, kommissionen, zuschlaege, summe_pos, netto = auswerten(text, profil)
     if not kommissionen:
-        raise ValueError("Keine Zwischensummen gefunden - ist das eine Schachermayer-Rechnung?")
+        raise ValueError(f"Keine Beträge gefunden (Profil {profil['name']}).")
     ziel = os.path.splitext(pfad)[0] + "_Kommissionen.xlsx"
     ok, *_ = schreibe_excel(ziel, info, kommissionen, zuschlaege, summe_pos, netto)
     return ziel, ok
